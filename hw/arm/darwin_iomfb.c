@@ -174,6 +174,31 @@
  * FourCC so a probe can test a hypothesis without a rebuild. Level 4 is that
  * same mechanism with the answers a measurement has already justified (see
  * iomfb_level4[]).
+ * DARWIN_DCP_IOMFB_ECHO_MODE=1 is a narrower, opt-in AP-consumer probe:
+ * after a model-ACKed A413 it echoes those IDs only in A442 block 0x41's
+ * current-mode words. It is not an H17P firmware implementation.
+ * DARWIN_DCP_IOMFB_A406_IDS=1 is another opt-in probe: A406 returns a
+ * monotonically assigned nonzero ID at out+0 with status 0 at out+4, and
+ * the model retains those IDs so later A407/A408 requests can be scored
+ * as hit/miss against +0x98. It does not emit D582/D594/D595 or change
+ * A408 completion. DARWIN_DCP_IOMFB_OUT still wins when it overrides A406.
+ * DARWIN_DCP_IOMFB_A406_OBJECTS=1 additionally keeps a minimal per-ID
+ * A406 object record and checks A407 +0x98 against it. A hit is only list
+ * membership, not the firmware's w25/w21 gate or a transfer. This switch
+ * implies A406_IDS; the ID-only marker remains available by itself.
+ * DARWIN_DCP_IOMFB_A407_TRANSFER=1 implies A406_OBJECTS and records an
+ * assumed w21=0 queue mark after an A407 HIT. A407 copies request+0x17c to
+ * minimal object state with objects mode even without this transfer opt-in.
+ * DARWIN_DCP_IOMFB_A407_COMPLETE=d582|d595|d594 is a separate default-off
+ * AP-handler hypothesis harness. It sends this build's payloads on the A407
+ * caller slot; it neither runs firmware policy nor names the true producer.
+ * DARWIN_DCP_IOMFB_A407_SCANOUT=1 is a separate QEMU-local presentation
+ * hypothesis. On a retained A407 HIT with the measured one-primary surface
+ * profile, it translates +0xf90 through dart-disp0/SID0 and copies pixels
+ * before any hypothetical D582 reply. It does not establish firmware w21.
+ * DARWIN_DCP_IOMFB_D572=1 appends one hypothetical 4-byte D572
+ * powerUpDART(enable=1, power_off=0) request after the configured callback
+ * script. It does not set DART registers or establish firmware policy.
  * DARWIN_DCP_IOMFB_CB='D000,@A385,D003:00000000:14' scripts outbound
  * callbacks; an @NAME item is a barrier that waits for that later AP RPC
  * before the following callback is sent. DARWIN_DCP_IOMFB_CB_AFTER names
@@ -244,6 +269,23 @@ typedef struct QEMU_PACKED {
 
 #define IOMFB_SWAP_QUEUE_SIZE 8
 
+typedef enum IOMFBA407Complete {
+    IOMFB_A407_COMPLETE_NONE,
+    IOMFB_A407_COMPLETE_D582,
+    IOMFB_A407_COMPLETE_D595,
+    IOMFB_A407_COMPLETE_D594,
+} IOMFBA407Complete;
+
+static const char *iomfb_a407_complete_name(IOMFBA407Complete mode)
+{
+    switch (mode) {
+    case IOMFB_A407_COMPLETE_D582: return "D582";
+    case IOMFB_A407_COMPLETE_D595: return "D595";
+    case IOMFB_A407_COMPLETE_D594: return "D594";
+    default: return "none";
+    }
+}
+
 struct DarwinIOMFB {
     DeviceState *asc;
     DeviceState *dart;
@@ -284,6 +326,13 @@ struct DarwinIOMFB {
      */
     GHashTable *out_override;   /* char* FourCC -> GByteArray* */
 
+    /* Opt-in AP-consumer probe: echo successful A413 IDs through A442 block
+     * 0x41's current-mode fields. This does not model H17P firmware behavior. */
+    bool echo_mode_probe;
+    bool echo_mode_valid;
+    uint32_t echo_color_id;
+    uint32_t echo_timing_id;
+
     /*
      * The outbound (D-series) experiment harness, DARWIN_DCP_IOMFB_CB. See
      * section 5 of the header comment for the transport and
@@ -303,6 +352,7 @@ struct DarwinIOMFB {
     bool cb_busy;
     bool cb_started;
     bool cb_flag9;          /* mirror the AP's own bit 9; see iomfb_callback_send */
+    bool d572_hypothesis;  /* opt-in scripted activation request, never default */
     char *cb_after;
     uint64_t cb_sent;
 
@@ -310,12 +360,26 @@ struct DarwinIOMFB {
      * actual request; completion state is separate from the boot script. */
     bool swap_enabled;
     bool scanout_enabled;
+    bool a407_scanout_enabled;
     uint32_t swap_ids[IOMFB_SWAP_QUEUE_SIZE];
     uint32_t swap_head, swap_count;
     bool swap_active, swap_failed;
     /* A408 remains outstanding until its same-slot D594 returns. */
     bool swap_nested[IOMFB_TAGS];
     uint32_t swap_nested_ids[IOMFB_TAGS];
+
+    /* Opt-in A406 ID-contract probe (DARWIN_DCP_IOMFB_A406_IDS=1). Allocates
+     * nonzero IDs and retains them for A407/A408 +0x98 hit/miss logging.
+     * Completion (D594/D595/D582) is intentionally unchanged. */
+    bool a406_ids_enabled;
+    bool a406_objects_enabled;
+    bool a407_transfer_enabled;
+    IOMFBA407Complete a407_complete_mode;
+    IOMFBA407Complete a407_nested[IOMFB_TAGS];
+    uint32_t a407_nested_ids[IOMFB_TAGS];
+    uint32_t a406_next_id;
+    GHashTable *a406_ids; /* GUINT_TO_POINTER(id) presence */
+    DarwinIOMFBSwapObjects a406_objects;
 };
 
 static int darwin_iomfb_post_load(void *opaque, int version_id)
@@ -492,14 +556,41 @@ static bool iomfb_dma(DarwinIOMFB *m, uint64_t dva, void *buf, uint32_t len,
 
 /* Pixel DMA is disp0/sid0, not the RPC heap's dcp/sid23. Proven by
  * a 1 MiB byte match against native IOSurface pixels in VISIBLE_R6. */
-static bool iomfb_scanout(const uint8_t *input, uint32_t len)
+static bool iomfb_scanout(const uint8_t *input, uint32_t len, bool a407,
+                         uint32_t id)
 {
     DarwinIOMFBSurface surface;
     DeviceState *dart = darwin_dart_find("dart-disp0");
     g_autofree uint8_t *pixels = NULL;
-    if (!dart || !darwin_iomfb_swap_surface(input, len, &surface)) {
-        fprintf(stderr, "iomfb: scanout unsupported primary BGRA profile\n");
+    bool parsed = a407 ? darwin_iomfb_a407_surface(input, len, &surface) :
+                         darwin_iomfb_swap_surface(input, len, &surface);
+
+    if (!parsed) {
+        if (a407) {
+            fprintf(stderr, "iomfb: HYPOTHESIS A407 scanout unsupported "
+                    "primary BGRA profile id=%u len=0x%x mask=0x%x "
+                    "flags=%02x/%02x/%02x/%02x\n", id, len,
+                    len >= 0x150 ? ldl_le_p(input + 0x14c) : 0,
+                    len > 0x1d26 ? input[0x1d23] : 0,
+                    len > 0x1d26 ? input[0x1d24] : 0,
+                    len > 0x1d26 ? input[0x1d25] : 0,
+                    len > 0x1d26 ? input[0x1d26] : 0);
+        } else {
+            fprintf(stderr, "iomfb: scanout unsupported primary BGRA profile\n");
+        }
         return false;
+    }
+    if (!dart) {
+        fprintf(stderr, "iomfb: %s scanout missing dart-disp0 id=%u\n",
+                a407 ? "HYPOTHESIS A407" : "A408", id);
+        return false;
+    }
+    if (a407) {
+        fprintf(stderr, "iomfb: HYPOTHESIS A407 scanout candidate id=%u "
+                "%ux%u stride=%u size=%u dva=0x%" PRIx64
+                " (HIT only; w21 unmeasured; before D582)\n",
+                id, surface.width, surface.height, surface.stride,
+                surface.size, surface.dva);
     }
     pixels = g_malloc(surface.size);
     for (uint32_t off = 0; off < surface.size; ) {
@@ -509,18 +600,38 @@ static bool iomfb_scanout(const uint8_t *input, uint32_t len)
             address_space_read(&address_space_memory, pa,
                                MEMTXATTRS_UNSPECIFIED, pixels + off,
                                chunk) != MEMTX_OK) {
-            fprintf(stderr, "iomfb: scanout DMA failed at 0x%" PRIx64 "\n", dva);
+            if (a407) {
+                fprintf(stderr, "iomfb: HYPOTHESIS A407 scanout DMA failed "
+                        "id=%u dart-disp0/SID0 dva=0x%" PRIx64
+                        " offset=0x%x\n", id, dva, off);
+            } else {
+                fprintf(stderr, "iomfb: scanout DMA failed at 0x%" PRIx64 "\n",
+                        dva);
+            }
             return false;
         }
         off += chunk;
     }
     if (!darwin_fb_present_bgra(pixels, surface.width, surface.height,
                                 surface.stride)) {
-        fprintf(stderr, "iomfb: scanout console geometry mismatch\n");
+        if (a407) {
+            fprintf(stderr, "iomfb: HYPOTHESIS A407 scanout console geometry "
+                    "mismatch id=%u\n", id);
+        } else {
+            fprintf(stderr, "iomfb: scanout console geometry mismatch\n");
+        }
         return false;
     }
-    fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%" PRIx64 "\n",
-            surface.width, surface.height, surface.stride, surface.dva);
+    if (a407) {
+        fprintf(stderr, "iomfb: HYPOTHESIS A407 presented %ux%u BGRA id=%u "
+                "stride=%u dva=0x%" PRIx64 " via dart-disp0/SID0\n",
+                surface.width, surface.height, id, surface.stride,
+                surface.dva);
+    } else {
+        fprintf(stderr, "iomfb: presented %ux%u BGRA, stride %u, dva 0x%" PRIx64
+                "\n", surface.width, surface.height, surface.stride,
+                surface.dva);
+    }
     return true;
 }
 
@@ -772,6 +883,11 @@ static bool iomfb_callback_send_slot(DarwinIOMFB *m, uint8_t ep,
     }
 
     m->cb_sent++;
+    if (m->d572_hypothesis && cb->name_be == 0x44353732) {
+        fprintf(stderr, "iomfb: HYPOTHESIS D572 activate callback sent "
+                "after configured script; in={01,00,00,00} out=4 "
+                "(no DART state forced)\n");
+    }
     fprintf(stderr, "iomfb: ep 0x%02x callback #%" PRIu64 " '%s' (0x%08x) in %u "
             "out %u -> heap+0x%x (tag %u) size 0x%x\n",
             ep, m->cb_sent, cb->name, cb->name_be, in_len, cb->out_len,
@@ -812,6 +928,44 @@ static bool iomfb_callback_send(DarwinIOMFB *m, uint8_t ep, const IOMFBCallback 
     return true;
 }
 
+/* Opt-in A406 ID contract. Firmware allocates a nonzero ID
+ * (docs/re/iomfb-dseries.md A406→A407 lineage); the generic model zeroes.
+ * Retain IDs only for later A407/A408 +0x98 scoring — no D595/D594 here. */
+static uint32_t iomfb_a406_alloc(DarwinIOMFB *m)
+{
+    uint32_t id = m->a406_next_id ? m->a406_next_id : 1;
+
+    m->a406_next_id = id + 1;
+    if (m->a406_next_id == 0) {
+        /* Firmware clamps wraparound to 1 at 0x042171xx. */
+        m->a406_next_id = 1;
+    }
+    if (!m->a406_ids) {
+        m->a406_ids = g_hash_table_new(NULL, NULL);
+    }
+    g_hash_table_insert(m->a406_ids, GUINT_TO_POINTER(id), GINT_TO_POINTER(1));
+    return id;
+}
+
+static void iomfb_a406_note_swap_req(DarwinIOMFB *m, uint32_t fourcc,
+                                     const uint8_t *in, uint32_t in_len)
+{
+    uint32_t id;
+    bool hit;
+
+    if (!m->a406_ids_enabled || !in || in_len < 0x9c) {
+        return;
+    }
+    id = ldl_le_p(in + 0x98);
+    hit = m->a406_ids &&
+          g_hash_table_contains(m->a406_ids, GUINT_TO_POINTER(id));
+    fprintf(stderr, "iomfb: PROBE A406-retained %c%c%c%c id=%u %s "
+            "(completion unchanged)\n",
+            (char)((fourcc >> 24) & 0xff), (char)((fourcc >> 16) & 0xff),
+            (char)((fourcc >> 8) & 0xff), (char)(fourcc & 0xff),
+            id, hit ? "HIT" : "MISS");
+}
+
 /* rpc_caller_gated handles incoming requests itself while awaiting a reply
  * (24A5430a a0ce750-a0ce770). Use the A408 caller's ack-0 RX window, whose
  * base is assigned at a0cf66c-a0cf67c. The native queue entry already exists
@@ -841,6 +995,68 @@ static bool iomfb_swap_send_nested(DarwinIOMFB *m, uint8_t ep, unsigned tag,
         m->swap_nested_ids[tag] = id;
         fprintf(stderr, "iomfb: swap id %u D594 nested on tag %u; A408 pending\n",
                 id, tag);
+    }
+    return sent;
+}
+
+/* Deliberate A/B hypotheses, not an A407->Dxxx firmware assignment. Use the
+ * waiting A407 caller's ack-0 slot, as the measured A408/D594 lock inversion
+ * forbids a separate asynchronous workloop while SwapEnd owns its lock. */
+static bool iomfb_a407_send_nested(DarwinIOMFB *m, uint8_t ep, unsigned tag,
+                                   uint32_t id)
+{
+    IOMFBA407Complete mode = m->a407_complete_mode;
+    IOMFBCallback cb = { 0 };
+    size_t in_len;
+    uint32_t out_len = 0;
+    bool sent;
+
+    if (tag >= IOMFB_TAGS || m->a407_nested[tag] || m->swap_nested[tag] ||
+        m->cb_busy || mode == IOMFB_A407_COMPLETE_NONE) {
+        return false;
+    }
+    switch (mode) {
+    case IOMFB_A407_COMPLETE_D582:
+        in_len = DARWIN_IOMFB_D582_INPUT_SIZE;
+        cb.name_be = 0x44353832;
+        break;
+    case IOMFB_A407_COMPLETE_D595:
+        in_len = DARWIN_IOMFB_D595_INPUT_SIZE;
+        out_len = DARWIN_IOMFB_D595_OUTPUT_SIZE;
+        cb.name_be = 0x44353935;
+        break;
+    case IOMFB_A407_COMPLETE_D594:
+        in_len = DARWIN_IOMFB_SWAP_COMPLETION_SIZE;
+        cb.name_be = 0x44353934;
+        break;
+    default:
+        return false;
+    }
+    memcpy(cb.name, iomfb_a407_complete_name(mode), 4);
+    cb.in = g_byte_array_sized_new(in_len);
+    g_byte_array_set_size(cb.in, in_len);
+    cb.out_len = out_len;
+    switch (mode) {
+    case IOMFB_A407_COMPLETE_D582:
+        darwin_iomfb_d582_completion(cb.in->data, id);
+        break;
+    case IOMFB_A407_COMPLETE_D595:
+        darwin_iomfb_d595_completion(cb.in->data, id);
+        break;
+    case IOMFB_A407_COMPLETE_D594:
+        darwin_iomfb_swap_completion(cb.in->data, id);
+        break;
+    default:
+        break;
+    }
+    sent = iomfb_callback_send_slot(m, ep, &cb, 0, tag);
+    g_byte_array_unref(cb.in);
+    if (sent) {
+        m->a407_nested[tag] = mode;
+        m->a407_nested_ids[tag] = id;
+        fprintf(stderr, "iomfb: HYPOTHESIS A407 %s nested sent id=%u "
+                "tag=%u (assumed w21=0; not firmware truth)\n",
+                iomfb_a407_complete_name(mode), id, tag);
     }
     return sent;
 }
@@ -1142,6 +1358,21 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
 
     if (subkind == 1) {
         unsigned tag = IOMFB_TAG(msg);
+        if (IOMFB_ACK(msg) == 0 && tag < IOMFB_TAGS &&
+            m->a407_nested[tag] != IOMFB_A407_COMPLETE_NONE) {
+            IOMFBA407Complete mode = m->a407_nested[tag];
+            uint32_t status = (uint32_t)(msg >> 16);
+
+            m->a407_nested[tag] = IOMFB_A407_COMPLETE_NONE;
+            fprintf(stderr, "iomfb: HYPOTHESIS A407 %s nested reply id=%u "
+                    "status=0x%x; A407 remains status 0\n",
+                    iomfb_a407_complete_name(mode), m->a407_nested_ids[tag],
+                    status);
+            iomfb_send(m, ep, 0x42ULL | ((uint64_t)tag << 10),
+                       "A407 after hypothetical nested completion, status 0");
+            iomfb_after_rpc(m, ep, "A407");
+            return;
+        }
         if (IOMFB_ACK(msg) == 0 && tag < IOMFB_TAGS && m->swap_nested[tag]) {
             uint32_t status = (uint32_t)(msg >> 16);
             m->swap_nested[tag] = false;
@@ -1322,6 +1553,11 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
      * driver 0xaaaaaaaa rather than nothing.
      */
     const char *how = "zeroed";
+    uint32_t a407_complete_id = 0;
+    bool a407_complete_ready = false;
+    uint32_t a407_scanout_id = 0;
+    bool a407_scanout_ready = false;
+    bool output_written = false;
     if (h.out_len && (uint64_t)sizeof(h) + h.in_len + h.out_len <= size) {
         g_autofree uint8_t *out = g_malloc0(h.out_len);
         GByteArray *ov = m->out_override ?
@@ -1330,18 +1566,137 @@ static void iomfb_class2(DarwinIOMFB *m, uint8_t ep, uint64_t msg) {
             memcpy(out, ov->data, MIN(ov->len, h.out_len));
             how = "PROBE override";
         }
+        if (m->echo_mode_probe && h.name == 0x41343133 &&
+            h.in_len >= 8 && h.out_len >= 4) {
+            m->echo_mode_valid = ldl_le_p(out) == 0;
+            if (m->echo_mode_valid) {
+                const uint8_t *in = buf + sizeof(h);
+                m->echo_color_id = ldl_le_p(in);
+                m->echo_timing_id = ldl_le_p(in + 4);
+                fprintf(stderr, "iomfb: PROBE model-ACKed A413 IDs "
+                        "color=%u timing=%u for later A442 block 0x41 echo\n",
+                        m->echo_color_id, m->echo_timing_id);
+            }
+        }
+        if (m->echo_mode_probe && m->echo_mode_valid &&
+            h.name == 0x41343432 && h.in_len >= 0x5c &&
+            h.out_len >= 0x1004 &&
+            ldl_le_p(buf + sizeof(h) + 8) == 0x41 &&
+            ldq_le_p(buf + sizeof(h) + 0x54) == 0x2c) {
+            /* _IOMobileFramebufferGetDigitalOutMode copies block words at
+             * +4/+8 to its two caller outputs (0x22a3968e4-0x22a3968ec).
+             * Keep the A442 trailing IOReturn at +0x1000 unchanged. */
+            stl_le_p(out + 4, m->echo_color_id);
+            stl_le_p(out + 8, m->echo_timing_id);
+            how = "PROBE A413-mode echo (A442 block 0x41 only)";
+            fprintf(stderr, "iomfb: PROBE A442 block 0x41 returns color=%u "
+                    "timing=%u from prior A413\n",
+                    m->echo_color_id, m->echo_timing_id);
+        }
+        /* A406 ID probe runs only when OUT did not override this FourCC, so
+         * a canned A406=... hypothesis remains usable for A/B. */
+        if (m->a406_ids_enabled && !ov && h.name == 0x41343036 &&
+            h.out_len >= 8) {
+            uint32_t id = iomfb_a406_alloc(m);
+
+            if (darwin_iomfb_a406_reply(out, h.out_len, id, 0)) {
+                how = "PROBE A406 nonzero ID";
+                fprintf(stderr, "iomfb: PROBE A406 allocated id=%u status=0 "
+                        "(retained; completion unchanged)\n", id);
+                if (m->a406_objects_enabled) {
+                    bool retained = darwin_iomfb_swap_objects_retain(
+                        &m->a406_objects, id);
+                    fprintf(stderr, "iomfb: PROBE A406 object %s id=%u "
+                            "(ID/list membership only; completion unchanged)\n",
+                            retained ? "RETAIN" : "DUPLICATE", id);
+                }
+            }
+        }
+        if (m->a406_ids_enabled &&
+            (h.name == 0x41343037 || h.name == 0x41343038)) {
+            iomfb_a406_note_swap_req(m, h.name, buf + sizeof(h), h.in_len);
+        }
+        if (m->a406_objects_enabled && !ov && h.name == 0x41343037) {
+            uint32_t id = 0;
+            uint32_t state = 0;
+            bool queued = false;
+            DarwinIOMFBSwapLookup lookup = darwin_iomfb_a407_object_update(
+                &m->a406_objects, buf + sizeof(h), h.in_len,
+                m->a407_transfer_enabled, &id, &state, &queued);
+
+            fprintf(stderr, "iomfb: PROBE A407 object lookup %s id=%u "
+                    "(firmware w21/list transfer not modeled; miss RC not modeled; "
+                    "completion hypothesis %s)\n",
+                    lookup == DARWIN_IOMFB_SWAP_LOOKUP_HIT ? "HIT" :
+                    lookup == DARWIN_IOMFB_SWAP_LOOKUP_MISS ? "MISS" : "INVALID",
+                    id, iomfb_a407_complete_name(m->a407_complete_mode));
+            if (lookup == DARWIN_IOMFB_SWAP_LOOKUP_HIT) {
+                a407_scanout_ready = m->a407_scanout_enabled;
+                a407_scanout_id = id;
+                fprintf(stderr, "iomfb: PROBE A407 object state id=%u "
+                        "request+0x17c=0x%x copied (gate unmodeled)\n",
+                        id, state);
+                if (m->a407_transfer_enabled) {
+                    /* w21 is firmware-only here. This is an explicitly
+                     * assumed transfer-eligible queue mark, not a callback. */
+                    fprintf(stderr, "iomfb: PROBE A407 TRANSFER_ASSUMED "
+                            "id=%u queued=%u (assumes w21=0; completion %s)\n",
+                            id, queued,
+                            iomfb_a407_complete_name(m->a407_complete_mode));
+                    a407_complete_ready = queued &&
+                        m->a407_complete_mode != IOMFB_A407_COMPLETE_NONE;
+                    a407_complete_id = id;
+                } else {
+                    fprintf(stderr, "iomfb: PROBE A407 gate/transfer "
+                            "unmodeled id=%u (completion unchanged)\n", id);
+                }
+            }
+            /* Keep status 0 on hit and miss. The real firmware miss code
+             * 0x8000000a is known, but the AP reaction is not established
+             * for this experiment; do not invent that reply here. */
+        }
         uint64_t out_dva = win + off + sizeof(h) + h.in_len;
         if (!iomfb_dma(m, out_dva, out, h.out_len, true)) {
             fprintf(stderr, "iomfb:   could not write the %u-byte output region at dva "
                     "0x%" PRIx64 "\n", h.out_len, out_dva);
-        } else if (m->debug) {
-            iomfb_hexdump("out", out, h.out_len);
+        } else {
+            output_written = true;
+            if (m->debug) {
+                iomfb_hexdump("out", out, h.out_len);
+            }
         }
     }
 
     /* Copy before any completion can release the native surface mapping. */
     if (m->scanout_enabled && h.name == 0x41343038) {
-        iomfb_scanout(buf + sizeof(h), h.in_len);
+        iomfb_scanout(buf + sizeof(h), h.in_len, false,
+                      h.in_len >= 0x9c ? ldl_le_p(buf + sizeof(h) + 0x98) : 0);
+    }
+    if (a407_scanout_ready && output_written && !nested) {
+        /* Surface DMA precedes the optional same-slot D582 hypothesis, so
+         * retirement cannot release the map before QEMU copies pixels. */
+        iomfb_scanout(buf + sizeof(h), h.in_len, true, a407_scanout_id);
+    }
+    if (a407_complete_ready && output_written && !nested) {
+        bool active = m->a407_complete_mode != IOMFB_A407_COMPLETE_D582;
+
+        if (darwin_iomfb_swap_objects_completion_claim(
+                &m->a406_objects, a407_complete_id, active)) {
+            if (active) {
+                fprintf(stderr, "iomfb: HYPOTHESIS A407 ACTIVE_ASSUMED "
+                        "id=%u (QEMU mark, not firmware promotion)\n",
+                        a407_complete_id);
+            }
+            if (iomfb_a407_send_nested(m, ep, tag, a407_complete_id)) {
+                return; /* A407 final reply follows the same-slot callback. */
+            }
+            darwin_iomfb_swap_objects_completion_abort(&m->a406_objects,
+                                                        a407_complete_id);
+            fprintf(stderr, "iomfb: HYPOTHESIS A407 %s send failed id=%u; "
+                    "replying without completion\n",
+                    iomfb_a407_complete_name(m->a407_complete_mode),
+                    a407_complete_id);
+        }
     }
     if (m->swap_enabled && h.name == 0x41343038 && !nested) {
         uint32_t id;
@@ -1427,17 +1782,75 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
     DarwinIOMFB *m = g_new0(DarwinIOMFB, 1);
     const char *dbg = getenv("DARWIN_DCP_IOMFB_DEBUG");
     const char *trace = getenv("DARWIN_DCP_IOMFB_RPC_TRACE");
+    const char *echo_mode = getenv("DARWIN_DCP_IOMFB_ECHO_MODE");
 
     m->asc = asc;
     m->dart = dart;
     m->sid = sid;
     m->level = level;
+    m->echo_mode_probe = level >= 3 && echo_mode && !strcmp(echo_mode, "1");
+    if (m->echo_mode_probe) {
+        fprintf(stderr, "iomfb: PROBE A413-to-A442 block-0x41 mode echo enabled; "
+                "not an H17P firmware model\n");
+    }
     const char *scanout = getenv("DARWIN_DCP_IOMFB_SCANOUT");
     m->scanout_enabled = level >= 3 && scanout && !strcmp(scanout, "1");
+    const char *a407_scanout = getenv("DARWIN_DCP_IOMFB_A407_SCANOUT");
+    m->a407_scanout_enabled = level >= 3 && a407_scanout &&
+                               !strcmp(a407_scanout, "1");
     const char *complete = getenv("DARWIN_DCP_IOMFB_COMPLETE");
     m->swap_enabled = level >= 3 && complete && !strcmp(complete, "1");
     if (m->swap_enabled) {
         fprintf(stderr, "iomfb: native A408/D594 swap completion enabled\n");
+    }
+    const char *a406_ids = getenv("DARWIN_DCP_IOMFB_A406_IDS");
+    const char *a406_objects = getenv("DARWIN_DCP_IOMFB_A406_OBJECTS");
+    const char *a407_transfer = getenv("DARWIN_DCP_IOMFB_A407_TRANSFER");
+    const char *a407_complete = getenv("DARWIN_DCP_IOMFB_A407_COMPLETE");
+
+    if (level >= 3 && a407_complete && *a407_complete) {
+        if (!strcmp(a407_complete, "d582")) {
+            m->a407_complete_mode = IOMFB_A407_COMPLETE_D582;
+        } else if (!strcmp(a407_complete, "d595")) {
+            m->a407_complete_mode = IOMFB_A407_COMPLETE_D595;
+        } else if (!strcmp(a407_complete, "d594")) {
+            m->a407_complete_mode = IOMFB_A407_COMPLETE_D594;
+        } else {
+            fprintf(stderr, "iomfb: unsupported A407_COMPLETE '%s'; "
+                    "hypothetical completion disabled\n", a407_complete);
+        }
+    }
+    m->a407_transfer_enabled = level >= 3 && a407_transfer &&
+                               !strcmp(a407_transfer, "1");
+    m->a407_transfer_enabled |=
+        m->a407_complete_mode != IOMFB_A407_COMPLETE_NONE;
+    m->a406_objects_enabled = level >= 3 && a406_objects &&
+                              !strcmp(a406_objects, "1");
+    m->a406_objects_enabled |= m->a407_transfer_enabled;
+    m->a406_ids_enabled = level >= 3 &&
+        ((a406_ids && !strcmp(a406_ids, "1")) || m->a406_objects_enabled);
+    if (m->a407_scanout_enabled && !m->a406_objects_enabled) {
+        fprintf(stderr, "iomfb: HYPOTHESIS A407 scanout requires "
+                "A406_OBJECTS; disabled\n");
+        m->a407_scanout_enabled = false;
+    } else if (m->a407_scanout_enabled) {
+        fprintf(stderr, "iomfb: HYPOTHESIS A407 scanout enabled for "
+                "retained HIT plus measured single-primary body; "
+                "firmware w21 unmeasured\n");
+    }
+    m->a406_next_id = 1;
+    if (m->a406_ids_enabled) {
+        fprintf(stderr, "iomfb: PROBE A406 nonzero ID allocation enabled; "
+                "completion unchanged\n");
+    }
+    if (m->a406_objects_enabled) {
+        fprintf(stderr, "iomfb: PROBE A406 object retain/A407 lookup enabled; "
+                "w21 and completion unchanged\n");
+    }
+    if (m->a407_transfer_enabled) {
+        fprintf(stderr, "iomfb: PROBE A407 assumed-transfer queue mark "
+                "enabled; assumes w21=0, completion hypothesis %s\n",
+                iomfb_a407_complete_name(m->a407_complete_mode));
     }
     m->debug = dbg && dbg[0] && dbg[0] != '0';
     m->rpc_trace = trace && trace[0] && trace[0] != '0';
@@ -1468,15 +1881,47 @@ DarwinIOMFB *darwin_iomfb_new(DeviceState *asc, DeviceState *dart, unsigned sid,
      * direction, which is the default at every level: the transport is
      * modelled, the policy is not. A353 is the default trigger because it is
      * the last RPC the AP issues before going quiet (docs/re/iomfb-link.md,
-     * addendum 2, run M4/L4).
+     * addendum 2, run M4/L4). DARWIN_DCP_IOMFB_CB_FILE is an alternate source
+     * for scripts too large for a single environment value and takes
+     * precedence over DARWIN_DCP_IOMFB_CB.
      */
+    g_autofree char *cb_file_contents = NULL;
     const char *cbs = getenv("DARWIN_DCP_IOMFB_CB");
+    const char *cb_file = getenv("DARWIN_DCP_IOMFB_CB_FILE");
+    if (cb_file && *cb_file) {
+        g_autoptr(GError) error = NULL;
+        if (!g_file_get_contents(cb_file, &cb_file_contents, NULL, &error)) {
+            fprintf(stderr, "iomfb: cannot read callback script file %s: %s\n",
+                    cb_file, error->message);
+            cbs = NULL;
+        } else {
+            cbs = cb_file_contents;
+        }
+    }
     if (cbs && *cbs) {
         const char *after = getenv("DARWIN_DCP_IOMFB_CB_AFTER");
         const char *f9 = getenv("DARWIN_DCP_IOMFB_CB_FLAG9");
         m->cb_after = g_strdup(after ? after : "A353");
         m->cb_flag9 = !(f9 && f9[0] == '0');
         iomfb_parse_callbacks(m, cbs);
+        const char *d572 = getenv("DARWIN_DCP_IOMFB_D572");
+        if (d572 && strcmp(d572, "1") == 0) {
+            /* H17P D572 (0xa0d9aa4) requires 4-byte input/output and
+             * passes bits 0 of bytes 0/1 to powerUpDART at 0xa0d9b74.
+             * Appending after the fixture's D128 ack keeps its setup
+             * sequence unchanged; this is a causal experiment, not a
+             * claim that real firmware sends D572 at this point. */
+            IOMFBCallback cb = { .name_be = 0x44353732, .out_len = 4 };
+            static const uint8_t in[4] = { 1, 0, 0, 0 };
+            memcpy(cb.name, "D572", 4);
+            cb.in = g_byte_array_new();
+            g_byte_array_append(cb.in, in, sizeof(in));
+            g_array_append_val(m->cb_script, cb);
+            m->d572_hypothesis = true;
+            fprintf(stderr, "iomfb: HYPOTHESIS D572 armed after %u "
+                    "configured callback items (activate=1, power_off=0; "
+                    "no DART MMIO forcing)\n", m->cb_script->len - 1);
+        }
         fprintf(stderr, "iomfb: PROBE callback script has %u entr%s, starting "
                 "after %s\n", m->cb_script->len,
                 m->cb_script->len == 1 ? "y" : "ies",

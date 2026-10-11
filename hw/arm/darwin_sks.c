@@ -187,16 +187,23 @@ bool darwin_sks_parse_migrate_request(const uint8_t *request,
     }
 
     tagged_data = request_size == SKS_MIGRATE_TAGGED_REQUEST_SIZE &&
-        result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_C &&
         /* SMP_SKS_CAPTURE6 captures Data 2 -> 3 during a warm-disk cold
          * boot (request SHA256 014e378d1667d4ae...). Like the existing
          * Data 4 -> 3 record, +0x68 is the source class, not a fixed volume
          * kind. Keep the exact Data tag, framing and destination checks. */
-        (result.record_kind == SKS_MIGRATE_TAGGED_DATA_RECORD_KIND ||
-         result.record_kind == SKS_MIGRATE_TAGGED_DATA_CLASS_B) &&
-        !memcmp(request + SKS_MIGRATE_TAGGED_RECORD_FIXED_OFF,
-                sks_migrate_tagged_data_record_fixed,
-                sizeof(sks_migrate_tagged_data_record_fixed));
+        /* DVM_BOOT2_OWNERS1 rejects Data 3 -> 4 (SHA256
+         * 2f4acb6d14b47cfd...) during LaunchServices container seeding on the
+         * freshly assembled cryptex parent. The unanswered request timed out
+         * and panicked AppleSEPKeyStore; accept only that exact Data-tag
+         * pair and retain all other framing checks. */
+        (((result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_C &&
+           (result.record_kind == SKS_MIGRATE_TAGGED_DATA_RECORD_KIND ||
+            result.record_kind == SKS_MIGRATE_TAGGED_DATA_CLASS_B)) ||
+          (result.target_class == SKS_MIGRATE_TAGGED_TARGET_CLASS_D &&
+           result.record_kind == SKS_MIGRATE_TAGGED_TARGET_CLASS_C)) &&
+         !memcmp(request + SKS_MIGRATE_TAGGED_RECORD_FIXED_OFF,
+                 sks_migrate_tagged_data_record_fixed,
+                 sizeof(sks_migrate_tagged_data_record_fixed)));
     tagged_user = request_size == SKS_MIGRATE_TAGGED_REQUEST_SIZE &&
         /* DISPLAY_NATIVE_R2's protected temporary-file creation also sends
          * the exact User-volume record with target class 1. Dropping it

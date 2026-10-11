@@ -42,6 +42,7 @@
  *   DARWIN_DCP_EPIC=off                   announce nothing (pre-EPIC behaviour)
  *   DARWIN_DCP_EPIC=all                   announce every service in dcp_services[]
  *   DARWIN_DCP_EPIC=dcpav-device-epic     announce just that one
+ *   DARWIN_DCP_EPIC_SKIP=name[,name...]    omit services from "all"
  *   DARWIN_DCP_EPIC_EP=0x22               ...on this endpoint (default 0x20)
  *   DARWIN_DCP_EPIC_OPTIONS=0             packet header options byte
  *
@@ -94,6 +95,26 @@ static const DCPService dcp_services[] = {
     { "dcpmipi-controller-epic",     "DCPMIPIControllerProxy" },
 };
 
+static bool dcp_epic_name_skipped(const char *skip_list, const char *name) {
+    if (!skip_list || !*skip_list) {
+        return false;
+    }
+
+    size_t name_len = strlen(name);
+    for (const char *start = skip_list; *start;) {
+        const char *end = strchr(start, ',');
+        size_t len = end ? (size_t)(end - start) : strlen(start);
+        if (len == name_len && !strncmp(start, name, len)) {
+            return true;
+        }
+        if (!end) {
+            break;
+        }
+        start = end + 1;
+    }
+    return false;
+}
+
 typedef struct DarwinDCP {
     DeviceState *asc;
     DarwinAFK *afk;
@@ -110,6 +131,7 @@ typedef struct DarwinDCP {
     bool announce;          /* DARWIN_DCP_EPIC != "off" */
     bool announce_all;      /* DARWIN_DCP_EPIC == "all" */
     const char *only;       /* a single EPICName, or NULL */
+    const char *skip;       /* comma-separated EPICNames omitted from "all" */
     uint8_t announce_ep;    /* which endpoint to announce on */
     uint8_t options;        /* EPIC packet header options byte */
     uint16_t next_iface;    /* firmware-chosen interface ids, 1-based */
@@ -290,6 +312,12 @@ static void dcp_afk_started(void *opaque, uint8_t ep) {
     }
     bool any = false;
     for (size_t i = 0; i < ARRAY_SIZE(dcp_services); i++) {
+        if (d->announce_all &&
+            dcp_epic_name_skipped(d->skip, dcp_services[i].epic_name)) {
+            fprintf(stderr, "dcp: skipping EPICName=%s (DARWIN_DCP_EPIC_SKIP)\n",
+                    dcp_services[i].epic_name);
+            continue;
+        }
         if (d->only && strcmp(d->only, dcp_services[i].epic_name)) {
             continue;
         }
@@ -456,6 +484,7 @@ DeviceState *darwin_dcp_create(struct dtree_node *dt_root, uint64_t iobase, Devi
     if (env && strcmp(env, "off") && strcmp(env, "all")) {
         d->only = env;
     }
+    d->skip = getenv("DARWIN_DCP_EPIC_SKIP");
     d->announce_ep = 0x20;
     if ((env = getenv("DARWIN_DCP_EPIC_EP"))) {
         d->announce_ep = (uint8_t)strtoul(env, NULL, 0);
@@ -524,9 +553,11 @@ DeviceState *darwin_dcp_create(struct dtree_node *dt_root, uint64_t iobase, Devi
     if (!d->announce) {
         fprintf(stderr, "dcp: EPIC announces disabled (DARWIN_DCP_EPIC=off)\n");
     } else {
-        fprintf(stderr, "dcp: will announce %s on ep 0x%02x (options 0x%02x)\n",
+        fprintf(stderr, "dcp: will announce %s%s%s on ep 0x%02x (options 0x%02x)\n",
                 d->announce_all ? "every confirmed service" :
                 d->only ? d->only : dcp_services[0].epic_name,
+                d->announce_all && d->skip ? " except " : "",
+                d->announce_all && d->skip ? d->skip : "",
                 d->announce_ep, d->options);
     }
     return d->asc;
